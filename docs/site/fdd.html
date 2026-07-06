@@ -10,7 +10,7 @@
   <header class="topbar">
     <span class="brand"><a href="index.html">Documentacao viva</a></span>
     <span class="commit" title="Commit de origem desta documentacao">
-      source_commit: <code>492dd85b257b61fe7a89475453bd96b0abf1bd44</code>
+      source_commit: <code>23de463e05e697216079277477dd505b1f7eca3e</code>
     </span>
   </header>
   <div class="layout">
@@ -370,7 +370,7 @@ X-Webhook-Id: 9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54
 </tr>
 <tr>
 <td><code>src/modules/orders/order.status.ts</code></td>
-<td>Fonte da verdade das transições (<code>transitions</code>, <code>canTransition</code>); define quais mudanças de status disparam eventos (ex.: <code>SHIPPED → DELIVERED</code>) e alimenta o filtro por endpoint</td>
+<td>Fonte da verdade das transições (<code>transitions</code>, <code>canTransition</code>); define quais mudanças de status disparam eventos (ex.: <code>SHIPPED → DELIVERED</code> e <code>SHIPPED → CANCELLED</code>) e alimenta o filtro por endpoint. Um pedido <code>SHIPPED</code> pode ir para <code>DELIVERED</code> ou <code>CANCELLED</code>; ambas as transições emitem <code>order.status_changed</code></td>
 </tr>
 <tr>
 <td><code>src/shared/errors/http-errors.ts</code> e <code>src/shared/errors/app-error.ts</code></td>
@@ -414,7 +414,7 @@ X-Webhook-Id: 9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54
 
       </article>
       <footer class="pagefoot">
-        <p>Gerado a partir do commit <code>492dd85b257b</code> em 2026-07-06T20:04:25.625Z.</p>
+        <p>Gerado a partir do commit <code>23de463e05e6</code> em 2026-07-06T20:09:56.995Z.</p>
       </footer>
     </main>
   </div>

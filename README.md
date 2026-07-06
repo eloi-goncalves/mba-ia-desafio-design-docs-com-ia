@@ -59,7 +59,60 @@ que vai codar amanhã. Regras invioláveis:
 1. **ADRs genéricos demais na primeira passada.** A geração inicial trouxe a política de retry sem os parâmetros exatos. Ajustei o prompt para exigir os valores fechados na reunião (5 tentativas, backoff `1m/5m/30m/2h/12h`) e a alternativa descartada de "3 tentativas", com o trade-off literal de `[09:16] Diego` (não cobre indisponibilidade de 2h de manutenção planejada).
 2. **Item fora de escopo vazando como requisito.** Uma versão inicial do PRD listou "notificação por email quando o webhook falha" como requisito funcional. Removi porque a reunião marcou email como futuro em `[09:37] Larissa` e `[09:38] Marcos`. O mesmo controle foi aplicado a dashboard, rate limiting de saída e webhooks inbound.
 3. **Duplicação de altura entre RFC e FDD.** O RFC começou a incluir payloads e matriz de erros; movi todo esse detalhe para o FDD e deixei o RFC apenas com a proposta em alto nível referenciando os ADRs, mantendo-o conciso.
-4. **Máquina de estados conferida contra o código.** Validei que os documentos descrevem `SHIPPED → [DELIVERED]` como estado atual, batendo 1:1 com o mapa `transitions` de `src/modules/orders/order.status.ts`, sem antecipar transições da Fase 2.
+4. **Máquina de estados conferida contra o código.** Na Parte 1 validei que os documentos descreviam `SHIPPED → [DELIVERED]` batendo 1:1 com o mapa `transitions` de `src/modules/orders/order.status.ts`, sem antecipar transições da Fase 2. Na Parte 2, o changeset sancionado adicionou `SHIPPED → CANCELLED` e o mecanismo de documentação viva atualizou o FDD para refletir a nova transição (ver a Demonstração abaixo).
+
+## Parte 2: Documentação viva em HTML
+
+O pacote da Parte 1 foi transformado em documentação que se mantém sincronizada com o código. O tooling vive em [tools/docs/](tools/docs/) (fora de `src/`) e expõe dois comandos:
+
+- `npm run docs:build`: gera o site estático navegável em [docs/site/](docs/site/) (PRD, RFC, FDD, ADRs e Tracker, com o hash do commit de origem visível) e o metadado [docs/site/docs-meta.json](docs/site/docs-meta.json).
+- `npm run docs:update`: mecanismo de auto-atualização de 5 etapas (lê `source_commit`, roda `git diff <source_commit>..HEAD`, roteia pelo Tracker as linhas `Fonte = CODIGO`, emite prompts direcionados por documento afetado e, com `--apply`, regera o HTML e re-ancora o `docs-meta.json`).
+
+O detalhe do mecanismo está em [docs/_work/plano-doc-viva.md](docs/_work/plano-doc-viva.md) e [tools/docs/README.md](tools/docs/README.md).
+
+### Demonstração da Parte 2
+
+#### 1. Estado inicial
+- source_commit antes da mudança: `492dd85b257b61fe7a89475453bd96b0abf1bd44`
+
+#### 2. A mudança
+```
+$ git apply fase-2/order-status-change.patch
+$ git diff --stat
+ src/modules/orders/order.status.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+$ git commit -m "feat(orders): permite transição SHIPPED -> CANCELLED (changeset fase 2)"
+Commit resultante: 23de463e05e697216079277477dd505b1f7eca3e
+```
+
+#### 3. A execução
+```
+$ npm run docs:update
+Etapa 1: source_commit ancorado = 492dd85b257b61fe7a89475453bd96b0abf1bd44
+         HEAD atual              = 23de463e05e697216079277477dd505b1f7eca3e
+
+Etapa 2: arquivos alterados (26): ... src/modules/orders/order.status.ts ...
+
+Etapa 3: roteamento pelo Tracker (Fonte = CODIGO):
+  docs/FDD.md  <=  src/modules/orders/order.status.ts  (IDs: FDD-INT-02)
+
+Etapa 4: gerando prompts direcionados (apenas trechos afetados + diff):
+  - docs/_work/update-prompts/docs__FDD.md.md  (docs/FDD.md)
+
+# aplicadas as edições no Markdown, roda a etapa 5:
+$ npm run docs:update -- --apply
+Etapa 5 concluida: HTML regerado, source_commit = 23de463e05e697216079277477dd505b1f7eca3e
+```
+
+Apesar de o `git diff` acusar 26 arquivos alterados, o roteamento pelo Tracker isolou **apenas** `docs/FDD.md` (linha `FDD-INT-02`, único item `Fonte = CODIGO` que aponta para `src/modules/orders/order.status.ts`). Update direcionado, não regeneração cega.
+
+#### 4. O resultado
+Diff do documento atualizado (antes/depois), refletindo `SHIPPED → CANCELLED`:
+```diff
+- | `src/modules/orders/order.status.ts` | Fonte da verdade das transições (`transitions`, `canTransition`); define quais mudanças de status disparam eventos (ex.: `SHIPPED → DELIVERED`) e alimenta o filtro por endpoint |
++ | `src/modules/orders/order.status.ts` | Fonte da verdade das transições (`transitions`, `canTransition`); define quais mudanças de status disparam eventos (ex.: `SHIPPED → DELIVERED` e `SHIPPED → CANCELLED`) e alimenta o filtro por endpoint. Um pedido `SHIPPED` pode ir para `DELIVERED` ou `CANCELLED`; ambas as transições emitem `order.status_changed` |
+```
+- Novo source_commit gravado em `docs/site/docs-meta.json`: `23de463e05e697216079277477dd505b1f7eca3e` (igual ao commit do passo 2).
 
 ## Como navegar a entrega
 

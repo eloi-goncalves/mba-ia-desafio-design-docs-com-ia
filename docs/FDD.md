@@ -287,7 +287,7 @@ Todos os códigos usam o prefixo `WEBHOOK_` e são serializados sem alteração 
 | Arquivo real | Como integrar |
 | --- | --- |
 | `src/modules/orders/order.service.ts` | Estender `changeStatus` para chamar `publishWebhookEvent(tx, order, fromStatus, toStatus)` dentro do `this.prisma.$transaction`, após `tx.orderStatusHistory.create` e antes do `refreshed`; se a inserção na outbox falhar, rollback (`[09:40] Bruno`, `[09:41] Diego`) |
-| `src/modules/orders/order.status.ts` | Fonte da verdade das transições (`transitions`, `canTransition`); define quais mudanças de status disparam eventos (ex.: `SHIPPED → DELIVERED`) e alimenta o filtro por endpoint |
+| `src/modules/orders/order.status.ts` | Fonte da verdade das transições (`transitions`, `canTransition`); define quais mudanças de status disparam eventos (ex.: `SHIPPED → DELIVERED` e `SHIPPED → CANCELLED`) e alimenta o filtro por endpoint. Um pedido `SHIPPED` pode ir para `DELIVERED` ou `CANCELLED`; ambas as transições emitem `order.status_changed` |
 | `src/shared/errors/http-errors.ts` e `src/shared/errors/app-error.ts` | Criar `WebhookNotFoundError`, `WebhookInvalidUrlError` etc. estendendo `AppError`/`NotFoundError`/`ValidationError`, seguindo o padrão de `InvalidStatusTransitionError` e `InsufficientStockError`, com códigos `WEBHOOK_*` |
 | `src/middlewares/error.middleware.ts` | Sem alteração: já converte `AppError`/`ZodError`/erros Prisma em `{ error: { code, message, details } }`; os erros `WEBHOOK_*` fluem direto (`[09:29] Bruno`) |
 | `src/middlewares/auth.middleware.ts` | Reusar `authenticate` no CRUD e `requireRole('ADMIN')` no endpoint de replay da DLQ (`[09:36] Larissa`) |
