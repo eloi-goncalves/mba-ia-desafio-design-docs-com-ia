@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RFC · Documentacao viva</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand"><a href="index.html">Documentacao viva</a></span>
+    <span class="commit" title="Commit de origem desta documentacao">
+      source_commit: <code>492dd85b257b61fe7a89475453bd96b0abf1bd44</code>
+    </span>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <p class="sidebar-title">Documentos</p>
+      <ul>
+<li><a href="prd.html">PRD</a></li>
+<li><a href="rfc.html" class="active">RFC</a></li>
+<li><a href="fdd.html">FDD</a></li>
+<li><a href="adrs/index.html">ADRs</a><ul class="adr-list"><li><a href="adrs/ADR-001-outbox-no-mysql.html">ADR-001-outbox-no-mysql</a></li><li><a href="adrs/ADR-002-retry-backoff-e-dlq.html">ADR-002-retry-backoff-e-dlq</a></li><li><a href="adrs/ADR-003-hmac-sha256-secret-por-endpoint.html">ADR-003-hmac-sha256-secret-por-endpoint</a></li><li><a href="adrs/ADR-004-at-least-once-x-event-id.html">ADR-004-at-least-once-x-event-id</a></li><li><a href="adrs/ADR-005-worker-separado-polling.html">ADR-005-worker-separado-polling</a></li><li><a href="adrs/ADR-006-reuso-padroes-do-projeto.html">ADR-006-reuso-padroes-do-projeto</a></li><li><a href="adrs/ADR-007-snapshot-do-payload-na-outbox.html">ADR-007-snapshot-do-payload-na-outbox</a></li></ul></li>
+<li><a href="tracker.html">Tracker</a></li>
+      </ul>
+    </nav>
+    <main class="content">
+      <article class="markdown-body">
+<h1>RFC: Sistema de Webhooks de Notificação de Pedidos</h1>
+<table>
+<thead>
+<tr>
+<th>Campo</th>
+<th>Valor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Autor</td>
+<td>Eloi Gonçalves (papel: Larissa, Tech Lead)</td>
+</tr>
+<tr>
+<td>Status</td>
+<td>Em revisão</td>
+</tr>
+<tr>
+<td>Data</td>
+<td>2026-07-03</td>
+</tr>
+<tr>
+<td>Revisores</td>
+<td>Marcos (PM), Bruno (Eng.), Diego (Eng. Sênior), Sofia (Segurança)</td>
+</tr>
+</tbody>
+</table>
+<h2>TL;DR</h2>
+<p>Proponho notificar clientes B2B sobre mudanças de status de pedidos via webhooks outbound, usando um padrão outbox transacional no MySQL existente, consumido por um worker em processo separado que faz polling a cada 2 segundos. As entregas são assinadas com HMAC-SHA256 (secret por endpoint), reentregues com backoff exponencial (5 tentativas) e movidas para uma DLQ ao esgotar. A garantia é at-least-once, com <code>X-Event-Id</code> para deduplicação no cliente. A solução reaproveita ao máximo os padrões já existentes do OMS.</p>
+<h2>Contexto e problema</h2>
+<p>Três clientes B2B (Atlas Comercial, MaxDistribuição e Nova Cargo) pediram formalmente para serem notificados em tempo real quando o status de seus pedidos muda. Hoje eles fazem polling no <code>GET /orders</code> de tempos em tempos, o que torna a integração lenta e cara para eles (<code>[09:00] Marcos</code>). Para esses clientes, &quot;tempo real&quot; é qualquer coisa abaixo de 10 segundos (<code>[09:02] Marcos</code>). A Atlas sinalizou que pode migrar para o concorrente se a feature não sair até o fim do trimestre, o que cria risco de churn (<code>[09:00] Marcos</code>). O escopo é exclusivamente outbound (da plataforma para o cliente); webhooks inbound estão fora (<code>[09:02] Sofia</code>, <code>[09:02] Marcos</code>).</p>
+<h2>Proposta técnica (visão geral)</h2>
+<p><strong>Outbox transacional no MySQL.</strong> Na mesma transação que atualiza <code>orders</code> e <code>order_status_history</code>, inserimos o evento em <code>webhook_outbox</code>, garantindo consistência com o commit/rollback da mudança de status. Ver <a href="adrs/ADR-001-outbox-no-mysql.md">ADR-001</a>.</p>
+<p><strong>Worker em processo separado com polling de 2s.</strong> Um entry-point <code>src/worker.ts</code> (<code>npm run worker</code>), com PrismaClient próprio, lê os pendentes mais antigos em batch e dispara as entregas. A latência mínima de ~2s cabe no requisito de &quot;abaixo de 10s&quot;. Ver <a href="adrs/ADR-005-worker-separado-polling.md">ADR-005</a>.</p>
+<p><strong>Retry com backoff e DLQ.</strong> Falhas são reentregues em 1m/5m/30m/2h/12h (5 tentativas); ao esgotar, o evento vai para <code>webhook_dead_letter</code>, com replay manual via endpoint admin. Ver <a href="adrs/ADR-002-retry-backoff-e-dlq.md">ADR-002</a>.</p>
+<p><strong>Assinatura HMAC-SHA256 com secret por endpoint.</strong> Cada endpoint tem secret única, rotacionável com grace period de 24h; a assinatura viaja em <code>X-Signature</code>. Ver <a href="adrs/ADR-003-hmac-sha256-secret-por-endpoint.md">ADR-003</a>.</p>
+<p><strong>Garantia at-least-once com <code>X-Event-Id</code>.</strong> O cliente pode receber o mesmo evento mais de uma vez e deduplica pelo <code>X-Event-Id</code>. Ver <a href="adrs/ADR-004-at-least-once-x-event-id.md">ADR-004</a>.</p>
+<p><strong>Reuso dos padrões do projeto.</strong> Módulo em <code>src/modules/webhooks/</code>, erros com prefixo <code>WEBHOOK_</code> estendendo <code>AppError</code>, error middleware, logger Pino e <code>requireRole</code> reaproveitados. Ver <a href="adrs/ADR-006-reuso-padroes-do-projeto.md">ADR-006</a>. O payload é um snapshot renderizado na inserção. Ver <a href="adrs/ADR-007-snapshot-do-payload-na-outbox.md">ADR-007</a>.</p>
+<h2>Alternativas consideradas</h2>
+<h3>Alternativa 1: disparo síncrono no <code>changeStatus</code></h3>
+<ul>
+<li>Trade-off que motivou o descarte: um HTTP call dentro da transação travaria a mudança de status de outros pedidos quando o cliente estivesse lento ou offline, e falha do cliente forçaria decisões ruins sobre rollback (<code>[09:04] Bruno</code>, <code>[09:06] Diego</code>). Ver <a href="adrs/ADR-001-outbox-no-mysql.md">ADR-001</a>.</li>
+</ul>
+<h3>Alternativa 2: Redis Streams / fila externa</h3>
+<ul>
+<li>Trade-off que motivou o descarte: exigiria subir infraestrutura nova (ex.: Redis Cluster) para um time pequeno; overengineering quando o MySQL existente resolve (<code>[09:07] Diego</code>). Ver <a href="adrs/ADR-001-outbox-no-mysql.md">ADR-001</a>.</li>
+</ul>
+<h3>Alternativa 3: exactly-once / trigger de banco para reatividade</h3>
+<ul>
+<li>Trade-off que motivou o descarte: exactly-once exigiria coordenação dos dois lados, muito mais complexo que at-least-once com <code>event_id</code> (<code>[09:25] Diego</code>); e o MySQL não tem listener nativo (NOTIFY/LISTEN), então trigger não notifica processo externo, tornando o polling de 2s a opção pragmática (<code>[09:09] Diego</code>).</li>
+</ul>
+<h2>Questões em aberto</h2>
+<ul>
+<li><strong>Rate limiting de saída:</strong> se um cliente tem muitos pedidos mudando de status em pouco tempo, podemos bombardeá-lo com muitas chamadas. Decisão adiada: observar e implementar se virar problema (<code>[09:38] Diego</code>, <code>[09:39] Larissa</code>).</li>
+<li><strong>Ordering global ao escalar para múltiplos workers:</strong> enquanto for single-worker, a ordem por <code>order_id</code> é implícita via <code>created_at</code>; ao paralelizar, perdemos essa garantia. Futuro via particionamento por <code>order_id</code> ou lock pessimista (<code>[09:12] Diego</code>, <code>[09:13] Diego</code>).</li>
+<li><strong>Notificação ao cliente sobre webhook com problema (email):</strong> adiada para a próxima fase, após medir o impacto (<code>[09:37] Larissa</code>, <code>[09:38] Marcos</code>).</li>
+<li><strong>Endurecimento de roles no CRUD de configuração:</strong> por enquanto qualquer role autenticada; pode ser endurecido mais adiante (<code>[09:37] Sofia</code>).</li>
+</ul>
+<h2>Impacto e riscos</h2>
+<p><strong>Impacto no sistema existente.</strong> A alteração crítica é dentro de <code>changeStatus</code> (<code>src/modules/orders/order.service.ts</code>), que passa a inserir na <code>webhook_outbox</code> dentro da mesma transação; se a inserção falhar, a transação inteira dá rollback (<code>[09:40] Bruno</code>, <code>[09:41] Diego</code>). Surge um novo processo (<code>src/worker.ts</code>) e novas tabelas no schema Prisma.</p>
+<p><strong>Riscos principais e mitigação em alto nível.</strong></p>
+<ul>
+<li>Acúmulo de linhas na outbox degradando o worker: mitigado por índices em estado e <code>created_at</code> e leitura em batch pequeno (<code>[09:08] Diego</code>); arquivamento futuro de linhas entregues.</li>
+<li>Vazamento de secret do cliente: mitigado por secret por endpoint e rotação com grace de 24h (<code>[09:21] Sofia</code>), além de <code>redact</code> no logger.</li>
+<li>Regressão na transação de status: mitigado por testes ponta a ponta e revisão de segurança da Sofia antes do deploy (<code>[09:46] Sofia</code>).</li>
+</ul>
+<h2>Decisões relacionadas (ADRs)</h2>
+<ul>
+<li><a href="adrs/ADR-001-outbox-no-mysql.md">ADR-001: Padrão Outbox transacional no MySQL</a></li>
+<li><a href="adrs/ADR-002-retry-backoff-e-dlq.md">ADR-002: Retry com backoff exponencial e DLQ</a></li>
+<li><a href="adrs/ADR-003-hmac-sha256-secret-por-endpoint.md">ADR-003: HMAC-SHA256 com secret por endpoint</a></li>
+<li><a href="adrs/ADR-004-at-least-once-x-event-id.md">ADR-004: Garantia at-least-once com X-Event-Id</a></li>
+<li><a href="adrs/ADR-005-worker-separado-polling.md">ADR-005: Worker em processo separado com polling</a></li>
+<li><a href="adrs/ADR-006-reuso-padroes-do-projeto.md">ADR-006: Reuso dos padrões existentes do projeto</a></li>
+<li><a href="adrs/ADR-007-snapshot-do-payload-na-outbox.md">ADR-007: Snapshot do payload na outbox</a></li>
+</ul>
+
+      </article>
+      <footer class="pagefoot">
+        <p>Gerado a partir do commit <code>492dd85b257b</code> em 2026-07-06T20:04:25.625Z.</p>
+      </footer>
+    </main>
+  </div>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: false });
+    const blocks = document.querySelectorAll('code.language-mermaid');
+    let i = 0;
+    for (const code of blocks) {
+      const pre = code.closest('pre');
+      const graph = document.createElement('div');
+      graph.className = 'mermaid';
+      graph.textContent = code.textContent;
+      pre.replaceWith(graph);
+    }
+    try { await mermaid.run(); } catch (e) { /* diagrama opcional */ }
+  </script>
+</body>
+</html>

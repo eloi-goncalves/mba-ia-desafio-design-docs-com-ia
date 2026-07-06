@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FDD · Documentacao viva</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand"><a href="index.html">Documentacao viva</a></span>
+    <span class="commit" title="Commit de origem desta documentacao">
+      source_commit: <code>492dd85b257b61fe7a89475453bd96b0abf1bd44</code>
+    </span>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <p class="sidebar-title">Documentos</p>
+      <ul>
+<li><a href="prd.html">PRD</a></li>
+<li><a href="rfc.html">RFC</a></li>
+<li><a href="fdd.html" class="active">FDD</a></li>
+<li><a href="adrs/index.html">ADRs</a><ul class="adr-list"><li><a href="adrs/ADR-001-outbox-no-mysql.html">ADR-001-outbox-no-mysql</a></li><li><a href="adrs/ADR-002-retry-backoff-e-dlq.html">ADR-002-retry-backoff-e-dlq</a></li><li><a href="adrs/ADR-003-hmac-sha256-secret-por-endpoint.html">ADR-003-hmac-sha256-secret-por-endpoint</a></li><li><a href="adrs/ADR-004-at-least-once-x-event-id.html">ADR-004-at-least-once-x-event-id</a></li><li><a href="adrs/ADR-005-worker-separado-polling.html">ADR-005-worker-separado-polling</a></li><li><a href="adrs/ADR-006-reuso-padroes-do-projeto.html">ADR-006-reuso-padroes-do-projeto</a></li><li><a href="adrs/ADR-007-snapshot-do-payload-na-outbox.html">ADR-007-snapshot-do-payload-na-outbox</a></li></ul></li>
+<li><a href="tracker.html">Tracker</a></li>
+      </ul>
+    </nav>
+    <main class="content">
+      <article class="markdown-body">
+<h1>FDD: Sistema de Webhooks de Notificação de Pedidos</h1>
+<p>Versão: 1.0 · Data: 2026-07-03 · Responsável: Eloi Gonçalves</p>
+<h2>1. Contexto e motivação técnica</h2>
+<p>Clientes B2B (Atlas Comercial, MaxDistribuição e Nova Cargo) precisam ser notificados quando o status de seus pedidos muda, em vez de fazer polling no <code>GET /orders</code> (<code>[09:00] Marcos</code>). A solução é um sistema de webhooks outbound baseado em outbox transacional no MySQL, consumido por um worker separado em polling, com retry/backoff, DLQ, assinatura HMAC-SHA256 e garantia at-least-once. As decisões de fundo estão nos ADRs; este documento descreve como implementar. O ponto de integração crítico é <code>changeStatus</code> em <code>src/modules/orders/order.service.ts</code>, cuja transação passa a gravar o evento na outbox (<code>[09:40] Bruno</code>, <code>[09:41] Diego</code>).</p>
+<h2>2. Objetivos técnicos</h2>
+<table>
+<thead>
+<tr>
+<th>Objetivo</th>
+<th>Medida / invariante</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Notificação quase em tempo real</td>
+<td>Latência de entrega abaixo de 10s para cliente saudável; polling de 2s dá piso de ~2s (<code>[09:10] Larissa</code>)</td>
+</tr>
+<tr>
+<td>Consistência com a mudança de status</td>
+<td>Invariante: evento existe se e somente se a transação de status commitou (outbox no mesmo <code>tx</code>) (<code>[09:06] Diego</code>)</td>
+</tr>
+<tr>
+<td>Entrega confiável</td>
+<td>at-least-once garantido; nenhuma perda silenciosa; falhas terminais vão para a DLQ (<code>[09:24] Diego</code>)</td>
+</tr>
+<tr>
+<td>Segurança da entrega</td>
+<td>100% das entregas assinadas com HMAC-SHA256 e secret por endpoint (<code>[09:20] Sofia</code>)</td>
+</tr>
+<tr>
+<td>Resiliência a indisponibilidade do cliente</td>
+<td>5 tentativas cobrindo janela de ~15h antes da DLQ (<code>[09:17] Diego</code>)</td>
+</tr>
+</tbody>
+</table>
+<h2>3. Escopo e exclusões</h2>
+<p><strong>Incluído:</strong> CRUD de configuração de webhook, filtro de eventos por status, histórico de deliveries, geração e rotação de secret, emissão transacional na outbox, worker de entrega com retry/backoff, DLQ com replay admin, entrega assinada.</p>
+<p><strong>Excluído (fora de escopo/adiado):</strong></p>
+<ul>
+<li>Notificação por email quando o webhook do cliente falha, adiado para a próxima fase (<code>[09:37] Larissa</code>, <code>[09:38] Marcos</code>).</li>
+<li>Rate limiting de saída, adiado para observar e decidir depois (<code>[09:38] Diego</code>, <code>[09:39] Larissa</code>).</li>
+<li>Dashboard/painel visual para o cliente, projeto do time de frontend (<code>[09:39] Marcos</code>, <code>[09:40] Larissa</code>).</li>
+<li>Ordering global / múltiplos workers em paralelo, limitação conhecida (<code>[09:12] Diego</code>, <code>[09:13] Larissa</code>).</li>
+<li>Webhooks inbound (cliente para nós), descartado (<code>[09:02] Sofia</code>, <code>[09:02] Marcos</code>).</li>
+</ul>
+<h2>4. Fluxos detalhados</h2>
+<h3>4.1 Criação do evento na outbox (dentro da transação de changeStatus)</h3>
+<ol>
+<li><code>changeStatus</code> abre <code>this.prisma.$transaction(async (tx) =&gt; { ... })</code> em <code>src/modules/orders/order.service.ts</code>.</li>
+<li>Valida transição via <code>canTransition</code> (<code>src/modules/orders/order.status.ts</code>), atualiza estoque quando aplicável.</li>
+<li><code>tx.order.update(...)</code> grava o novo <code>status</code>.</li>
+<li><code>tx.orderStatusHistory.create(...)</code> registra a auditoria da transição.</li>
+<li>Chama <code>publishWebhookEvent(tx, order, fromStatus, toStatus)</code>: consulta se algum webhook do <code>customer</code> quer o <code>toStatus</code>; se nenhum quiser, não insere nada (filtro na inserção, <code>[09:34] Bruno</code>).</li>
+<li>Para cada webhook interessado, renderiza o snapshot do payload e insere uma linha em <code>webhook_outbox</code> com <code>event_id</code> (UUID), <code>status = PENDING</code> e o payload materializado (<code>[09:52] Diego</code>).</li>
+<li>Se a inserção falhar, a exceção propaga e a transação inteira dá rollback (<code>[09:40] Bruno</code>).</li>
+<li><code>tx.order.findUnique(...)</code> relê o estado final e retorna.</li>
+</ol>
+<h3>4.2 Processamento pelo worker (polling 2s)</h3>
+<ol>
+<li><code>src/worker.ts</code> inicializa um PrismaClient próprio e entra em loop.</li>
+<li>A cada 2s, seleciona em batch as linhas <code>PENDING</code> (e as <code>RETRYING</code> cujo <code>next_attempt_at &lt;= now</code>) ordenadas por <code>created_at</code>.</li>
+<li>Marca a linha como <code>PROCESSING</code>.</li>
+<li>Monta os headers (<code>X-Event-Id</code>, <code>X-Signature</code>, <code>X-Timestamp</code>, <code>X-Webhook-Id</code>, <code>Content-Type</code>) e faz <code>POST</code> na <code>url</code> do endpoint com timeout de 10s (<code>[09:42] Diego</code>).</li>
+<li>Em <code>2xx</code>: marca <code>DELIVERED</code> e grava um registro de delivery (sucesso, status HTTP, tempo de resposta).</li>
+<li>Em falha (timeout, erro de rede, status não 2xx): registra a tentativa e aplica o backoff (fluxo 4.3).</li>
+</ol>
+<h3>4.3 Retry com backoff (1m/5m/30m/2h/12h)</h3>
+<ol>
+<li>Incrementa <code>attempts</code> da linha.</li>
+<li>Se <code>attempts &lt; 5</code>: calcula <code>next_attempt_at = now + offset[attempts]</code>, onde <code>offset = [1m, 5m, 30m, 2h, 12h]</code>, e marca <code>RETRYING</code> (<code>[09:17] Diego</code>).</li>
+<li>Grava um registro de delivery com o resultado da tentativa (falha, status HTTP/erro, tempo).</li>
+<li>Se <code>attempts == 5</code> e ainda falhou: aciona o fluxo 4.4 (DLQ).</li>
+</ol>
+<h3>4.4 Movimentação para a DLQ e replay manual</h3>
+<ol>
+<li>Insere o evento em <code>webhook_dead_letter</code> com payload, motivo da falha e timestamp (<code>[09:18] Diego</code>).</li>
+<li>Remove/encerra a linha correspondente na outbox.</li>
+<li>Replay manual: <code>POST /admin/webhooks/dead-letter/:id/replay</code> (role ADMIN) recoloca o evento na <code>webhook_outbox</code> como <code>PENDING</code> e loga quem executou, para auditoria (<code>[09:35] Diego</code>, <code>[09:36] Sofia</code>).</li>
+</ol>
+<pre><code class="language-mermaid">sequenceDiagram
+    participant O as OrderService.changeStatus (tx)
+    participant OB as webhook_outbox
+    participant W as Worker (polling 2s)
+    participant C as Cliente (endpoint)
+    participant DLQ as webhook_dead_letter
+    O-&gt;&gt;OB: INSERT evento (snapshot, PENDING) [mesmo tx]
+    loop a cada 2s
+        W-&gt;&gt;OB: SELECT pendentes/retry por created_at
+        W-&gt;&gt;C: POST payload + X-Signature (timeout 10s)
+        alt 2xx
+            C--&gt;&gt;W: 200
+            W-&gt;&gt;OB: marca DELIVERED + delivery
+        else falha e attempts&lt;5
+            W-&gt;&gt;OB: attempts++, RETRYING (backoff)
+        else falha e attempts==5
+            W-&gt;&gt;DLQ: move evento
+        end
+    end
+</code></pre>
+<h2>5. Contratos públicos</h2>
+<p>Todos os endpoints de configuração exigem <code>authenticate</code>; o replay exige <code>requireRole('ADMIN')</code> (<code>src/middlewares/auth.middleware.ts</code>).</p>
+<h3>5.1 POST /webhooks (cadastro; retorna secret gerada)</h3>
+<p>Request:</p>
+<pre><code class="language-http">POST /api/v1/webhooks
+Authorization: Bearer &lt;jwt&gt;
+Content-Type: application/json
+
+{
+  &quot;customerId&quot;: &quot;e3b0c442-98fc-4c14-9af5-1b2c3d4e5f60&quot;,
+  &quot;url&quot;: &quot;https://atlas.example.com/hooks/orders&quot;,
+  &quot;subscribedStatuses&quot;: [&quot;SHIPPED&quot;, &quot;DELIVERED&quot;]
+}
+</code></pre>
+<p>Response <code>201 Created</code> (a <code>secret</code> só aparece na criação):</p>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54&quot;,
+  &quot;customerId&quot;: &quot;e3b0c442-98fc-4c14-9af5-1b2c3d4e5f60&quot;,
+  &quot;url&quot;: &quot;https://atlas.example.com/hooks/orders&quot;,
+  &quot;subscribedStatuses&quot;: [&quot;SHIPPED&quot;, &quot;DELIVERED&quot;],
+  &quot;secret&quot;: &quot;whsec_2b1c9d8e7f6a5b4c3d2e1f0a9b8c7d6e&quot;,
+  &quot;active&quot;: true,
+  &quot;createdAt&quot;: &quot;2026-07-03T12:00:00.000Z&quot;
+}
+</code></pre>
+<p>Status: <code>201</code> criado; <code>400</code> <code>WEBHOOK_INVALID_URL</code> (url não <code>https</code>); <code>422</code> <code>WEBHOOK_PAYLOAD_TOO_LARGE</code> não se aplica aqui; <code>401</code> sem token.</p>
+<h3>5.2 GET /webhooks?customerId=... e GET /webhooks/:id</h3>
+<p>Request:</p>
+<pre><code class="language-http">GET /api/v1/webhooks?customerId=e3b0c442-98fc-4c14-9af5-1b2c3d4e5f60
+Authorization: Bearer &lt;jwt&gt;
+</code></pre>
+<p>Response <code>200 OK</code> (secret nunca é retornada em leitura):</p>
+<pre><code class="language-json">{
+  &quot;data&quot;: [
+    {
+      &quot;id&quot;: &quot;9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54&quot;,
+      &quot;customerId&quot;: &quot;e3b0c442-98fc-4c14-9af5-1b2c3d4e5f60&quot;,
+      &quot;url&quot;: &quot;https://atlas.example.com/hooks/orders&quot;,
+      &quot;subscribedStatuses&quot;: [&quot;SHIPPED&quot;, &quot;DELIVERED&quot;],
+      &quot;active&quot;: true
+    }
+  ],
+  &quot;pagination&quot;: { &quot;page&quot;: 1, &quot;pageSize&quot;: 20, &quot;total&quot;: 1 }
+}
+</code></pre>
+<p>Status: <code>200</code> ok; <code>404</code> <code>WEBHOOK_NOT_FOUND</code> (em <code>GET /webhooks/:id</code> inexistente); <code>401</code> sem token.</p>
+<h3>5.3 PATCH /webhooks/:id e DELETE /webhooks/:id</h3>
+<p>Request:</p>
+<pre><code class="language-http">PATCH /api/v1/webhooks/9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54
+Authorization: Bearer &lt;jwt&gt;
+Content-Type: application/json
+
+{ &quot;subscribedStatuses&quot;: [&quot;DELIVERED&quot;], &quot;active&quot;: false }
+</code></pre>
+<p>Response <code>200 OK</code>:</p>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54&quot;,
+  &quot;url&quot;: &quot;https://atlas.example.com/hooks/orders&quot;,
+  &quot;subscribedStatuses&quot;: [&quot;DELIVERED&quot;],
+  &quot;active&quot;: false
+}
+</code></pre>
+<p><code>DELETE /api/v1/webhooks/:id</code> responde <code>204 No Content</code>.
+Status: <code>200</code>/<code>204</code> ok; <code>404</code> <code>WEBHOOK_NOT_FOUND</code>; <code>400</code> <code>WEBHOOK_INVALID_URL</code> se a url for alterada para não <code>https</code>; <code>401</code> sem token.</p>
+<h3>5.4 GET /webhooks/:id/deliveries (histórico de entregas)</h3>
+<p>Request:</p>
+<pre><code class="language-http">GET /api/v1/webhooks/9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54/deliveries
+Authorization: Bearer &lt;jwt&gt;
+</code></pre>
+<p>Response <code>200 OK</code>:</p>
+<pre><code class="language-json">{
+  &quot;data&quot;: [
+    {
+      &quot;id&quot;: &quot;6d5c4b3a-2f1e-0d9c-8b7a-6f5e4d3c2b1a&quot;,
+      &quot;eventId&quot;: &quot;1b2c3d4e-5f60-7a8b-9c0d-1e2f3a4b5c6d&quot;,
+      &quot;status&quot;: &quot;DELIVERED&quot;,
+      &quot;httpStatus&quot;: 200,
+      &quot;responseTimeMs&quot;: 143,
+      &quot;attempt&quot;: 1,
+      &quot;createdAt&quot;: &quot;2026-07-03T12:00:03.000Z&quot;
+    }
+  ],
+  &quot;pagination&quot;: { &quot;page&quot;: 1, &quot;pageSize&quot;: 20, &quot;total&quot;: 1 }
+}
+</code></pre>
+<p>Status: <code>200</code> ok; <code>404</code> <code>WEBHOOK_NOT_FOUND</code>; <code>401</code> sem token.</p>
+<h3>5.5 POST /webhooks/:id/rotate-secret (rotação com grace 24h)</h3>
+<p>Request:</p>
+<pre><code class="language-http">POST /api/v1/webhooks/9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54/rotate-secret
+Authorization: Bearer &lt;jwt&gt;
+</code></pre>
+<p>Response <code>200 OK</code> (a secret antiga permanece válida por 24h):</p>
+<pre><code class="language-json">{
+  &quot;secret&quot;: &quot;whsec_7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a&quot;,
+  &quot;previousSecretValidUntil&quot;: &quot;2026-07-04T12:00:00.000Z&quot;
+}
+</code></pre>
+<p>Status: <code>200</code> ok; <code>404</code> <code>WEBHOOK_NOT_FOUND</code>; <code>401</code> sem token.</p>
+<h3>5.6 POST /admin/webhooks/dead-letter/:id/replay (role ADMIN)</h3>
+<p>Request:</p>
+<pre><code class="language-http">POST /api/v1/admin/webhooks/dead-letter/6d5c4b3a-2f1e-0d9c-8b7a-6f5e4d3c2b1a/replay
+Authorization: Bearer &lt;jwt-admin&gt;
+</code></pre>
+<p>Response <code>202 Accepted</code>:</p>
+<pre><code class="language-json">{ &quot;outboxId&quot;: &quot;0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d&quot;, &quot;status&quot;: &quot;PENDING&quot; }
+</code></pre>
+<p>Status: <code>202</code> recolocado na outbox; <code>403</code> <code>FORBIDDEN</code> (role não ADMIN); <code>404</code> <code>WEBHOOK_NOT_FOUND</code> (item de DLQ inexistente); <code>401</code> sem token.</p>
+<h3>5.7 Request OUTBOUND enviado ao cliente pelo worker</h3>
+<pre><code class="language-http">POST https://atlas.example.com/hooks/orders
+Content-Type: application/json
+X-Event-Id: 1b2c3d4e-5f60-7a8b-9c0d-1e2f3a4b5c6d
+X-Signature: sha256=4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e
+X-Timestamp: 2026-07-03T12:00:02.000Z
+X-Webhook-Id: 9f1a7c2e-5b3d-4a6f-8e21-0c9d8b7a6f54
+
+{
+  &quot;event_id&quot;: &quot;1b2c3d4e-5f60-7a8b-9c0d-1e2f3a4b5c6d&quot;,
+  &quot;event_type&quot;: &quot;order.status_changed&quot;,
+  &quot;timestamp&quot;: &quot;2026-07-03T12:00:00.000Z&quot;,
+  &quot;order_id&quot;: &quot;a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d&quot;,
+  &quot;order_number&quot;: &quot;ORD-2026-000123&quot;,
+  &quot;from_status&quot;: &quot;PROCESSING&quot;,
+  &quot;to_status&quot;: &quot;SHIPPED&quot;,
+  &quot;customer_id&quot;: &quot;e3b0c442-98fc-4c14-9af5-1b2c3d4e5f60&quot;,
+  &quot;total_cents&quot;: 158900
+}
+</code></pre>
+<p>O <code>X-Signature</code> é o HMAC-SHA256 do corpo bruto usando a secret do endpoint (<code>[09:20] Sofia</code>, <code>[09:44] Diego</code>). O cliente deve deduplicar pelo <code>X-Event-Id</code> (<code>[09:25] Diego</code>).</p>
+<h2>6. Matriz de erros (códigos WEBHOOK_*)</h2>
+<table>
+<thead>
+<tr>
+<th>Código</th>
+<th>HTTP status</th>
+<th>Condição</th>
+<th>Tratamento</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WEBHOOK_NOT_FOUND</code></td>
+<td>404</td>
+<td>Webhook ou item de DLQ inexistente</td>
+<td>Estende <code>NotFoundError</code>; serializado pelo error middleware</td>
+</tr>
+<tr>
+<td><code>WEBHOOK_INVALID_URL</code></td>
+<td>400</td>
+<td>URL não <code>https</code> no cadastro/edição</td>
+<td>Estende <code>ValidationError</code>; validação no schema Zod (<code>[09:23] Sofia</code>)</td>
+</tr>
+<tr>
+<td><code>WEBHOOK_SECRET_REQUIRED</code></td>
+<td>400</td>
+<td>Operação que exige secret sem secret configurada</td>
+<td>Estende <code>ValidationError</code></td>
+</tr>
+<tr>
+<td><code>WEBHOOK_PAYLOAD_TOO_LARGE</code></td>
+<td>422</td>
+<td>Payload do evento acima de 64KB</td>
+<td>Estende <code>UnprocessableEntityError</code>; erro, não trunca (<code>[09:23] Sofia</code>)</td>
+</tr>
+<tr>
+<td><code>WEBHOOK_DELIVERY_FAILED</code></td>
+<td>502</td>
+<td>Falha de entrega registrada em contexto síncrono</td>
+<td>Estende <code>AppError</code>; usado em replay síncrono/diagnóstico</td>
+</tr>
+</tbody>
+</table>
+<p>Todos os códigos usam o prefixo <code>WEBHOOK_</code> e são serializados sem alteração pelo <code>errorMiddleware</code> (<code>src/middlewares/error.middleware.ts</code>).</p>
+<h2>7. Estratégias de resiliência</h2>
+<ul>
+<li>Timeout HTTP de 10s por tentativa; cliente que não responde a tempo é tratado como falha (<code>[09:42] Diego</code>).</li>
+<li>5 tentativas com backoff exponencial 1m/5m/30m/2h/12h (<code>[09:17] Diego</code>).</li>
+<li>Ao esgotar as tentativas, o evento vai para <code>webhook_dead_letter</code> (<code>[09:18] Diego</code>).</li>
+<li>Sem rollback da mudança de status por falha de entrega: a transação de status já commitou; a entrega é assíncrona e independente (<code>[09:06] Diego</code>).</li>
+<li>Snapshot do payload na inserção garante que a entrega reflete o estado do momento da mudança, mesmo após horas de retry (<code>[09:52] Larissa</code>).</li>
+</ul>
+<h2>8. Observabilidade</h2>
+<ul>
+<li><strong>Métricas:</strong> <code>webhook_deliveries_total</code> (por resultado), <code>webhook_retry_total</code>, <code>webhook_dlq_total</code> e latência de entrega (histograma do tempo de resposta do <code>POST</code> outbound).</li>
+<li><strong>Logs estruturados via Pino</strong> (<code>src/shared/logger/index.ts</code>): campos <code>event_id</code>, <code>webhook_id</code>, <code>attempt</code>, <code>http_status</code>, <code>response_time_ms</code>, <code>result</code>; <code>redactPaths</code> protege <code>secret</code> e <code>X-Signature</code> para não vazar em log (<code>[09:29] Bruno</code>).</li>
+<li><strong>Tracing:</strong> spans no worker cobrindo a leitura do batch, o envio HTTP e a persistência do resultado, correlacionados por <code>event_id</code>.</li>
+</ul>
+<h2>9. Dependências e compatibilidade</h2>
+<ul>
+<li>Prisma/MySQL existente; nenhuma infraestrutura nova (<code>[09:07] Diego</code>).</li>
+<li>Novas tabelas: <code>webhook_config</code> (endpoint + secret + <code>customer_id</code> + status), <code>webhook_outbox</code>, <code>webhook_dead_letter</code>, <code>webhook_delivery</code>, todas com <code>@default(uuid())</code> seguindo o padrão de <code>prisma/schema.prisma</code> (<code>[09:51] Larissa</code>).</li>
+<li>Nenhuma lib nova além do módulo <code>crypto</code> nativo do Node para o HMAC-SHA256 (<code>[09:20] Sofia</code>).</li>
+</ul>
+<h2>10. Critérios de aceite técnicos</h2>
+<ul>
+<li>[ ] Inserção na <code>webhook_outbox</code> ocorre dentro da transação do <code>changeStatus</code>; falha na inserção causa rollback.</li>
+<li>[ ] Worker separado (<code>src/worker.ts</code>) processa pendentes em polling de 2s com PrismaClient próprio.</li>
+<li>[ ] Retry aplica exatamente 1m/5m/30m/2h/12h e move para DLQ após a 5ª falha.</li>
+<li>[ ] Toda entrega inclui <code>X-Event-Id</code>, <code>X-Signature</code> (HMAC-SHA256), <code>X-Timestamp</code>, <code>X-Webhook-Id</code>.</li>
+<li>[ ] Cadastro recusa URL não <code>https</code> com <code>WEBHOOK_INVALID_URL</code>.</li>
+<li>[ ] Payload acima de 64KB gera <code>WEBHOOK_PAYLOAD_TOO_LARGE</code>.</li>
+<li>[ ] Rotação de secret mantém a antiga válida por 24h.</li>
+<li>[ ] Replay da DLQ exige role ADMIN e registra quem executou.</li>
+</ul>
+<h2>11. Riscos e mitigação</h2>
+<table>
+<thead>
+<tr>
+<th>Risco</th>
+<th>Mitigação</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Acúmulo de linhas na outbox degrada o worker</td>
+<td>Índices em estado e <code>created_at</code>; leitura em batch pequeno; arquivamento futuro (<code>[09:08] Diego</code>)</td>
+</tr>
+<tr>
+<td>Vazamento de secret do cliente</td>
+<td>Secret por endpoint, rotação com grace de 24h, <code>redact</code> no logger (<code>[09:21] Sofia</code>)</td>
+</tr>
+<tr>
+<td>Regressão na transação de status</td>
+<td>Testes ponta a ponta e revisão de segurança da Sofia antes do deploy (<code>[09:46] Sofia</code>)</td>
+</tr>
+<tr>
+<td>Entregas fora de ordem ao escalar</td>
+<td>Manter single-worker por enquanto; particionar por <code>order_id</code> no futuro (<code>[09:13] Diego</code>)</td>
+</tr>
+</tbody>
+</table>
+<h2>12. Integração com o sistema existente (OBRIGATÓRIA)</h2>
+<table>
+<thead>
+<tr>
+<th>Arquivo real</th>
+<th>Como integrar</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/modules/orders/order.service.ts</code></td>
+<td>Estender <code>changeStatus</code> para chamar <code>publishWebhookEvent(tx, order, fromStatus, toStatus)</code> dentro do <code>this.prisma.$transaction</code>, após <code>tx.orderStatusHistory.create</code> e antes do <code>refreshed</code>; se a inserção na outbox falhar, rollback (<code>[09:40] Bruno</code>, <code>[09:41] Diego</code>)</td>
+</tr>
+<tr>
+<td><code>src/modules/orders/order.status.ts</code></td>
+<td>Fonte da verdade das transições (<code>transitions</code>, <code>canTransition</code>); define quais mudanças de status disparam eventos (ex.: <code>SHIPPED → DELIVERED</code>) e alimenta o filtro por endpoint</td>
+</tr>
+<tr>
+<td><code>src/shared/errors/http-errors.ts</code> e <code>src/shared/errors/app-error.ts</code></td>
+<td>Criar <code>WebhookNotFoundError</code>, <code>WebhookInvalidUrlError</code> etc. estendendo <code>AppError</code>/<code>NotFoundError</code>/<code>ValidationError</code>, seguindo o padrão de <code>InvalidStatusTransitionError</code> e <code>InsufficientStockError</code>, com códigos <code>WEBHOOK_*</code></td>
+</tr>
+<tr>
+<td><code>src/middlewares/error.middleware.ts</code></td>
+<td>Sem alteração: já converte <code>AppError</code>/<code>ZodError</code>/erros Prisma em <code>{ error: { code, message, details } }</code>; os erros <code>WEBHOOK_*</code> fluem direto (<code>[09:29] Bruno</code>)</td>
+</tr>
+<tr>
+<td><code>src/middlewares/auth.middleware.ts</code></td>
+<td>Reusar <code>authenticate</code> no CRUD e <code>requireRole('ADMIN')</code> no endpoint de replay da DLQ (<code>[09:36] Larissa</code>)</td>
+</tr>
+<tr>
+<td><code>src/shared/logger/index.ts</code></td>
+<td>Reusar o <code>logger</code> Pino e <code>redactPaths</code>; garantir redaction de <code>secret</code> e <code>X-Signature</code> (<code>[09:29] Bruno</code>)</td>
+</tr>
+<tr>
+<td><code>src/server.ts</code> e <code>src/app.ts</code></td>
+<td>Molde para o novo <code>src/worker.ts</code> (processo separado, PrismaClient próprio, graceful shutdown); registrar rotas de webhooks no <code>/api/v1</code> via <code>buildApp</code></td>
+</tr>
+<tr>
+<td><code>prisma/schema.prisma</code></td>
+<td>Novos models <code>webhook_config</code>, <code>webhook_outbox</code>, <code>webhook_dead_letter</code>, <code>webhook_delivery</code> seguindo <code>@id @default(uuid()) @db.Char(36)</code></td>
+</tr>
+</tbody>
+</table>
+<p>Confirmação de existência dos arquivos citados na seção 12 (todos verificados no repositório):</p>
+<ul>
+<li><code>src/modules/orders/order.service.ts</code>: existe.</li>
+<li><code>src/modules/orders/order.status.ts</code>: existe.</li>
+<li><code>src/shared/errors/http-errors.ts</code>: existe.</li>
+<li><code>src/shared/errors/app-error.ts</code>: existe.</li>
+<li><code>src/middlewares/error.middleware.ts</code>: existe.</li>
+<li><code>src/middlewares/auth.middleware.ts</code>: existe.</li>
+<li><code>src/shared/logger/index.ts</code>: existe.</li>
+<li><code>src/server.ts</code>: existe.</li>
+<li><code>src/app.ts</code>: existe.</li>
+<li><code>prisma/schema.prisma</code>: existe.</li>
+</ul>
+
+      </article>
+      <footer class="pagefoot">
+        <p>Gerado a partir do commit <code>492dd85b257b</code> em 2026-07-06T20:04:25.625Z.</p>
+      </footer>
+    </main>
+  </div>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: false });
+    const blocks = document.querySelectorAll('code.language-mermaid');
+    let i = 0;
+    for (const code of blocks) {
+      const pre = code.closest('pre');
+      const graph = document.createElement('div');
+      graph.className = 'mermaid';
+      graph.textContent = code.textContent;
+      pre.replaceWith(graph);
+    }
+    try { await mermaid.run(); } catch (e) { /* diagrama opcional */ }
+  </script>
+</body>
+</html>

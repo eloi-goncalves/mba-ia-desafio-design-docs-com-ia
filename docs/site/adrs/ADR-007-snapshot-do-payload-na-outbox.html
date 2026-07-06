@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ADR-007-snapshot-do-payload-na-outbox · Documentacao viva</title>
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand"><a href="../index.html">Documentacao viva</a></span>
+    <span class="commit" title="Commit de origem desta documentacao">
+      source_commit: <code>492dd85b257b61fe7a89475453bd96b0abf1bd44</code>
+    </span>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <p class="sidebar-title">Documentos</p>
+      <ul>
+<li><a href="../prd.html">PRD</a></li>
+<li><a href="../rfc.html">RFC</a></li>
+<li><a href="../fdd.html">FDD</a></li>
+<li><a href="../adrs/index.html">ADRs</a><ul class="adr-list"><li><a href="../adrs/ADR-001-outbox-no-mysql.html">ADR-001-outbox-no-mysql</a></li><li><a href="../adrs/ADR-002-retry-backoff-e-dlq.html">ADR-002-retry-backoff-e-dlq</a></li><li><a href="../adrs/ADR-003-hmac-sha256-secret-por-endpoint.html">ADR-003-hmac-sha256-secret-por-endpoint</a></li><li><a href="../adrs/ADR-004-at-least-once-x-event-id.html">ADR-004-at-least-once-x-event-id</a></li><li><a href="../adrs/ADR-005-worker-separado-polling.html">ADR-005-worker-separado-polling</a></li><li><a href="../adrs/ADR-006-reuso-padroes-do-projeto.html">ADR-006-reuso-padroes-do-projeto</a></li><li><a href="../adrs/ADR-007-snapshot-do-payload-na-outbox.html" class="active">ADR-007-snapshot-do-payload-na-outbox</a></li></ul></li>
+<li><a href="../tracker.html">Tracker</a></li>
+      </ul>
+    </nav>
+    <main class="content">
+      <article class="markdown-body">
+<h1>ADR-007: Snapshot do payload na inserção da outbox</h1>
+<ul>
+<li><strong>Status:</strong> Aceito</li>
+<li><strong>Data:</strong> 2026-07-03</li>
+<li><strong>Decisores:</strong> Larissa (Tech Lead), Diego (Eng. Sênior), Bruno (Eng.)</li>
+<li><strong>Origem:</strong> reunião técnica de Webhooks, ver <code>TRANSCRICAO.md</code></li>
+</ul>
+<h2>Contexto</h2>
+<p>Ao inserir o evento na <code>webhook_outbox</code>, é preciso decidir o que gravar: o payload já renderizado (snapshot do estado no momento da mudança de status) ou apenas o <code>order_id</code> para renderizar o payload na hora do envio. Como a entrega pode ocorrer segundos ou horas depois (retry/backoff, ver ADR-002), o pedido pode ter mudado nesse intervalo, gerando casos esquisitos se o payload for renderizado tardiamente (<code>[09:51] Bruno</code>, <code>[09:52] Larissa</code>).</p>
+<h2>Decisão</h2>
+<p>A outbox guarda o <strong>payload já renderizado na inserção</strong> (snapshot), refletindo o estado de quando o status mudou, e não apenas o <code>order_id</code> para renderizar depois (<code>[09:52] Larissa</code>, <code>[09:52] Diego</code>, <code>[09:52] Bruno</code>). O payload segue o formato JSON acordado: <code>event_id</code>, <code>event_type</code> (<code>order.status_changed</code>), timestamp ISO 8601, <code>order_id</code>, <code>order_number</code>, <code>from_status</code>, <code>to_status</code>, <code>customer_id</code>, <code>total_cents</code>, sem <code>items</code> para não inflar (<code>[09:43] Diego</code>).</p>
+<h2>Alternativas consideradas</h2>
+<h3>Guardar apenas <code>order_id</code> e renderizar no envio</h3>
+<ul>
+<li>Descrição: persistir só a referência do pedido e montar o payload na hora do disparo.</li>
+<li>Por que foi descartada (trade-off): se o pedido mudar entre a inserção e o envio (especialmente após retries), o evento entregue não refletiria o estado da mudança que o gerou, criando inconsistência (<code>[09:52] Larissa</code>).</li>
+</ul>
+<h2>Consequências</h2>
+<p><strong>Positivas</strong></p>
+<ul>
+<li>O evento entregue sempre reflete o estado de quando o status mudou, mesmo após horas de retry (<code>[09:52] Larissa</code>).</li>
+<li>Envio não depende de reler o pedido, simplificando o worker.</li>
+</ul>
+<p><strong>Negativas / trade-offs aceitos</strong></p>
+<ul>
+<li>Duplicação de dados: o payload fica materializado na outbox, ocupando mais espaço (aceito; mitigado pelo arquivamento futuro das linhas entregues, <code>[09:08] Diego</code>).</li>
+</ul>
+<h2>Relacionados</h2>
+<ul>
+<li><a href="ADR-001-outbox-no-mysql.md">ADR-001: Padrão Outbox transacional no MySQL</a></li>
+<li><a href="ADR-004-at-least-once-x-event-id.md">ADR-004: Garantia at-least-once com X-Event-Id</a></li>
+</ul>
+
+      </article>
+      <footer class="pagefoot">
+        <p>Gerado a partir do commit <code>492dd85b257b</code> em 2026-07-06T20:04:25.625Z.</p>
+      </footer>
+    </main>
+  </div>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: false });
+    const blocks = document.querySelectorAll('code.language-mermaid');
+    let i = 0;
+    for (const code of blocks) {
+      const pre = code.closest('pre');
+      const graph = document.createElement('div');
+      graph.className = 'mermaid';
+      graph.textContent = code.textContent;
+      pre.replaceWith(graph);
+    }
+    try { await mermaid.run(); } catch (e) { /* diagrama opcional */ }
+  </script>
+</body>
+</html>

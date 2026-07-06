@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PRD · Documentacao viva</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand"><a href="index.html">Documentacao viva</a></span>
+    <span class="commit" title="Commit de origem desta documentacao">
+      source_commit: <code>492dd85b257b61fe7a89475453bd96b0abf1bd44</code>
+    </span>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <p class="sidebar-title">Documentos</p>
+      <ul>
+<li><a href="prd.html" class="active">PRD</a></li>
+<li><a href="rfc.html">RFC</a></li>
+<li><a href="fdd.html">FDD</a></li>
+<li><a href="adrs/index.html">ADRs</a><ul class="adr-list"><li><a href="adrs/ADR-001-outbox-no-mysql.html">ADR-001-outbox-no-mysql</a></li><li><a href="adrs/ADR-002-retry-backoff-e-dlq.html">ADR-002-retry-backoff-e-dlq</a></li><li><a href="adrs/ADR-003-hmac-sha256-secret-por-endpoint.html">ADR-003-hmac-sha256-secret-por-endpoint</a></li><li><a href="adrs/ADR-004-at-least-once-x-event-id.html">ADR-004-at-least-once-x-event-id</a></li><li><a href="adrs/ADR-005-worker-separado-polling.html">ADR-005-worker-separado-polling</a></li><li><a href="adrs/ADR-006-reuso-padroes-do-projeto.html">ADR-006-reuso-padroes-do-projeto</a></li><li><a href="adrs/ADR-007-snapshot-do-payload-na-outbox.html">ADR-007-snapshot-do-payload-na-outbox</a></li></ul></li>
+<li><a href="tracker.html">Tracker</a></li>
+      </ul>
+    </nav>
+    <main class="content">
+      <article class="markdown-body">
+<h1>PRD: Sistema de Webhooks de Notificação de Pedidos</h1>
+<p>Versão: 1.0 · Data: 2026-07-03 · Responsável: Eloi Gonçalves</p>
+<h2>Resumo e contexto da feature</h2>
+<p>O OMS passará a notificar clientes B2B, via webhooks outbound, sempre que o status de um pedido mudar, eliminando a necessidade de eles fazerem polling no <code>GET /orders</code>. A solução usa outbox transacional, worker em polling, retry/backoff, DLQ e entrega assinada com HMAC-SHA256. Este PRD consolida o &quot;por quê&quot; e o &quot;o quê&quot;; o &quot;como&quot; está no <a href="FDD.md">FDD</a> e nos <a href="adrs/">ADRs</a>.</p>
+<h2>Problema e motivação</h2>
+<p>Três clientes B2B (Atlas Comercial, MaxDistribuição e Nova Cargo) pediram formalmente para serem notificados em tempo real sobre mudanças de status de pedidos (<code>[09:00] Marcos</code>). Hoje eles fazem polling no <code>GET /orders</code>, o que torna a integração lenta e cara (<code>[09:00] Marcos</code>). Para eles, &quot;tempo real&quot; é qualquer latência abaixo de 10 segundos (<code>[09:02] Marcos</code>). A Atlas indicou que pode migrar para o concorrente se a feature não sair até o fim do trimestre, criando risco de churn (<code>[09:00] Marcos</code>).</p>
+<h2>Público-alvo e cenários de uso</h2>
+<ul>
+<li><strong>Clientes B2B integradores</strong> (Atlas, MaxDistribuição, Nova Cargo): cadastram endpoints e recebem notificações assinadas para reagir a mudanças de status (<code>[09:00] Marcos</code>, <code>[09:31] Marcos</code>).</li>
+<li><strong>Operadores da plataforma:</strong> gerenciam a configuração de webhooks via API autenticada (<code>[09:32] Marcos</code>).</li>
+<li><strong>Administradores:</strong> reprocessam eventos da DLQ quando necessário (<code>[09:35] Diego</code>, <code>[09:36] Sofia</code>).</li>
+</ul>
+<p>Cenário típico: um pedido muda de <code>PROCESSING</code> para <code>SHIPPED</code>; em até ~2s o worker entrega o evento assinado ao endpoint da Atlas, que atualiza o sistema dela sem polling.</p>
+<h2>Objetivos e métricas de sucesso</h2>
+<table>
+<thead>
+<tr>
+<th>Objetivo</th>
+<th>Métrica</th>
+<th>Meta</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Notificar mudança de status quase em tempo real</td>
+<td>Latência da notificação</td>
+<td>&lt; 10s para cliente saudável (<code>[09:02] Marcos</code>, <code>[09:10] Larissa</code>)</td>
+</tr>
+<tr>
+<td>Reduzir polling dos clientes</td>
+<td>Chamadas <code>GET /orders</code> de integração</td>
+<td>Redução significativa</td>
+</tr>
+<tr>
+<td>Entregar de forma confiável</td>
+<td>Taxa de eventos entregues (incl. após retry) antes da DLQ</td>
+<td>Alta; DLQ só após 5 tentativas em ~15h (<code>[09:17] Diego</code>)</td>
+</tr>
+<tr>
+<td>Garantir integridade e origem</td>
+<td>Percentual de entregas assinadas com HMAC-SHA256</td>
+<td>100% (<code>[09:20] Sofia</code>)</td>
+</tr>
+</tbody>
+</table>
+<h2>Escopo</h2>
+<h3>Incluso</h3>
+<ul>
+<li>CRUD de configuração de webhook (cadastrar, editar, remover, listar).</li>
+<li>Filtro de eventos por status desejado por endpoint.</li>
+<li>Histórico de deliveries por webhook.</li>
+<li>Geração e rotação de secret com grace period de 24h.</li>
+<li>Emissão transacional do evento no <code>changeStatus</code>.</li>
+<li>Entrega assinada com retry/backoff e DLQ com replay admin.</li>
+</ul>
+<h3>Fora de escopo</h3>
+<ul>
+<li><strong>Notificação por email quando o webhook do cliente falha:</strong> adiado para a próxima fase, após medir impacto (<code>[09:37] Larissa</code>, <code>[09:38] Marcos</code>).</li>
+<li><strong>Rate limiting de saída:</strong> adiado, observar e decidir depois (<code>[09:38] Diego</code>, <code>[09:39] Larissa</code>).</li>
+<li><strong>Dashboard/painel visual para o cliente:</strong> descartado, projeto do time de frontend (<code>[09:39] Marcos</code>, <code>[09:40] Larissa</code>).</li>
+<li><strong>Ordering global / múltiplos workers:</strong> limitação conhecida, adiada (<code>[09:12] Diego</code>, <code>[09:13] Larissa</code>).</li>
+<li><strong>Webhooks inbound (cliente para nós):</strong> descartado, escopo é só outbound (<code>[09:02] Sofia</code>, <code>[09:02] Marcos</code>).</li>
+</ul>
+<h2>Requisitos funcionais</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Nome</th>
+<th>Descrição</th>
+<th>Prioridade</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FR-001</td>
+<td>Cadastrar webhook</td>
+<td><code>POST</code> autenticado com <code>url</code>, <code>customerId</code> (body/path) e lista de status; secret gerada pela plataforma e devolvida na criação (<code>[09:31] Marcos</code>, <code>[09:32] Larissa</code>)</td>
+<td>Alta</td>
+</tr>
+<tr>
+<td>FR-002</td>
+<td>Editar webhook</td>
+<td><code>PATCH</code> para alterar a configuração do endpoint (<code>[09:33] Bruno</code>)</td>
+<td>Alta</td>
+</tr>
+<tr>
+<td>FR-003</td>
+<td>Remover webhook</td>
+<td><code>DELETE</code> para remover o endpoint (<code>[09:33] Bruno</code>)</td>
+<td>Alta</td>
+</tr>
+<tr>
+<td>FR-004</td>
+<td>Listar webhooks do customer</td>
+<td><code>GET</code> para listar os webhooks de um customer (<code>[09:33] Bruno</code>)</td>
+<td>Alta</td>
+</tr>
+<tr>
+<td>FR-005</td>
+<td>Filtro de eventos por endpoint</td>
+<td>Cada webhook escolhe quais status quer ouvir; filtro aplicado na inserção da outbox (<code>[09:33] Marcos</code>, <code>[09:34] Bruno</code>)</td>
+<td>Alta</td>
+</tr>
+<tr>
+<td>FR-006</td>
+<td>Histórico de deliveries</td>
+<td><code>GET /webhooks/:id/deliveries</code> com últimas entregas: sucesso/falha, payload, response, tempo de resposta (<code>[09:34] Marcos</code>)</td>
+<td>Média</td>
+</tr>
+<tr>
+<td>FR-007</td>
+<td>Replay de DLQ (admin)</td>
+<td><code>POST /admin/webhooks/dead-letter/:id/replay</code>, role ADMIN, recoloca na outbox e loga quem fez (<code>[09:35] Diego</code>, <code>[09:36] Sofia</code>)</td>
+<td>Média</td>
+</tr>
+<tr>
+<td>FR-008</td>
+<td>Geração e rotação de secret</td>
+<td>Secret gerada pela plataforma; endpoint para pedir nova secret; antiga válida por 24h em paralelo (<code>[09:21] Sofia</code>, <code>[09:22] Sofia</code>)</td>
+<td>Alta</td>
+</tr>
+<tr>
+<td>FR-009</td>
+<td>Emissão transacional do evento</td>
+<td>Inserção na <code>webhook_outbox</code> dentro da transação do <code>changeStatus</code>; se a outbox falhar, rollback (<code>[09:40] Bruno</code>, <code>[09:41] Diego</code>)</td>
+<td>Alta</td>
+</tr>
+<tr>
+<td>FR-010</td>
+<td>Entrega assinada ao cliente</td>
+<td>Worker envia <code>POST</code> com payload JSON assinado (HMAC-SHA256) e headers <code>X-Event-Id</code>/<code>X-Signature</code>/<code>X-Timestamp</code>/<code>X-Webhook-Id</code> (<code>[09:20] Sofia</code>, <code>[09:44] Diego</code>)</td>
+<td>Alta</td>
+</tr>
+</tbody>
+</table>
+<h2>Requisitos não funcionais</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Requisito</th>
+<th>Descrição</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RNF-01</td>
+<td>TLS obrigatório</td>
+<td>URL do webhook deve ser <code>https</code>; <code>http</code> é recusado na validação Zod (<code>[09:23] Sofia</code>)</td>
+</tr>
+<tr>
+<td>RNF-02</td>
+<td>Limite de payload 64KB</td>
+<td>Evento acima de 64KB gera erro, não trunca (<code>[09:23] Sofia</code>, <code>[09:24] Larissa</code>)</td>
+</tr>
+<tr>
+<td>RNF-03</td>
+<td>Timeout HTTP de 10s</td>
+<td>Envio que passa de 10s é falha e vai para retry (<code>[09:42] Diego</code>)</td>
+</tr>
+<tr>
+<td>RNF-04</td>
+<td>Garantia at-least-once</td>
+<td>Cliente pode receber o mesmo evento mais de uma vez e deduplica por <code>X-Event-Id</code> (<code>[09:24] Diego</code>, <code>[09:25] Diego</code>)</td>
+</tr>
+<tr>
+<td>RNF-05</td>
+<td>Observabilidade via Pino</td>
+<td>Logging estruturado do worker/entregas com <code>redact</code> de secret/token (<code>[09:29] Bruno</code>)</td>
+</tr>
+<tr>
+<td>RNF-06</td>
+<td>Auditoria do replay</td>
+<td>Endpoint admin de replay registra quem executou (<code>[09:36] Sofia</code>)</td>
+</tr>
+</tbody>
+</table>
+<h2>Decisões e trade-offs principais</h2>
+<ul>
+<li>Outbox transacional no MySQL em vez de fila externa ou disparo síncrono. Ver <a href="adrs/ADR-001-outbox-no-mysql.md">ADR-001</a>.</li>
+<li>Retry com backoff 1m/5m/30m/2h/12h e DLQ separada. Ver <a href="adrs/ADR-002-retry-backoff-e-dlq.md">ADR-002</a>.</li>
+<li>HMAC-SHA256 com secret por endpoint e rotação com grace de 24h. Ver <a href="adrs/ADR-003-hmac-sha256-secret-por-endpoint.md">ADR-003</a>.</li>
+<li>Garantia at-least-once com <code>X-Event-Id</code>. Ver <a href="adrs/ADR-004-at-least-once-x-event-id.md">ADR-004</a>.</li>
+<li>Worker em processo separado com polling de 2s. Ver <a href="adrs/ADR-005-worker-separado-polling.md">ADR-005</a>.</li>
+<li>Reuso dos padrões existentes do projeto. Ver <a href="adrs/ADR-006-reuso-padroes-do-projeto.md">ADR-006</a>.</li>
+<li>Snapshot do payload na inserção. Ver <a href="adrs/ADR-007-snapshot-do-payload-na-outbox.md">ADR-007</a>.</li>
+</ul>
+<h2>Dependências</h2>
+<ul>
+<li>Infraestrutura MySQL e Prisma existentes; novas tabelas de webhook (<code>[09:07] Diego</code>, <code>[09:51] Larissa</code>).</li>
+<li>Módulo <code>crypto</code> nativo do Node para o HMAC (<code>[09:20] Sofia</code>).</li>
+<li>Alteração no <code>changeStatus</code> do módulo de pedidos (<code>[09:40] Bruno</code>).</li>
+<li>Novo processo/worker e script <code>npm run worker</code> (<code>[09:11] Larissa</code>).</li>
+<li>Janela de revisão de segurança da Sofia antes do deploy (<code>[09:46] Sofia</code>).</li>
+</ul>
+<h2>Riscos e mitigação</h2>
+<table>
+<thead>
+<tr>
+<th>Risco</th>
+<th>Probabilidade</th>
+<th>Impacto</th>
+<th>Mitigação</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vazamento de secret do cliente</td>
+<td>Média</td>
+<td>Alto</td>
+<td>Secret por endpoint e rotação com grace de 24h; <code>redact</code> no logger (<code>[09:21] Sofia</code>, <code>[09:22] Diego</code>)</td>
+</tr>
+<tr>
+<td>Cliente indisponível por horas perde eventos</td>
+<td>Média</td>
+<td>Alto</td>
+<td>5 tentativas com backoff até ~15h e DLQ com replay manual (<code>[09:17] Diego</code>, <code>[09:18] Diego</code>)</td>
+</tr>
+<tr>
+<td>Regressão na transação de mudança de status</td>
+<td>Baixa</td>
+<td>Alto</td>
+<td>Inserção na outbox dentro do <code>tx</code>; testes ponta a ponta e revisão da Sofia (<code>[09:41] Diego</code>, <code>[09:46] Sofia</code>)</td>
+</tr>
+<tr>
+<td>Entregas fora de ordem ao escalar workers</td>
+<td>Baixa</td>
+<td>Médio</td>
+<td>Single-worker por enquanto; particionar por <code>order_id</code> no futuro (<code>[09:13] Diego</code>)</td>
+</tr>
+</tbody>
+</table>
+<h2>Critérios de aceitação</h2>
+<ul>
+<li>Cliente consegue cadastrar, editar, listar e remover webhooks autenticado.</li>
+<li>Mudança de status gera evento na outbox dentro da mesma transação.</li>
+<li>Evento é entregue assinado em menos de 10s para cliente saudável.</li>
+<li>Falhas seguem o backoff definido e vão para a DLQ após 5 tentativas.</li>
+<li>Replay da DLQ funciona apenas para role ADMIN e é auditado.</li>
+<li>URLs não <code>https</code> e payloads acima de 64KB são recusados.</li>
+</ul>
+<h2>Estratégia de testes e validação</h2>
+<ul>
+<li>Testes unitários dos schemas Zod (URL <code>https</code>, limite de 64KB) e das classes de erro <code>WEBHOOK_*</code>.</li>
+<li>Testes de integração do <code>changeStatus</code> garantindo inserção transacional e rollback em falha da outbox.</li>
+<li>Testes do worker cobrindo sucesso, retry com backoff e movimentação para DLQ.</li>
+<li>Teste ponta a ponta de entrega assinada (verificação do HMAC-SHA256 e dos headers).</li>
+<li>Revisão de segurança da geração/rotação de secret e do HMAC antes do deploy (<code>[09:46] Sofia</code>).</li>
+</ul>
+
+      </article>
+      <footer class="pagefoot">
+        <p>Gerado a partir do commit <code>492dd85b257b</code> em 2026-07-06T20:04:25.625Z.</p>
+      </footer>
+    </main>
+  </div>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: false });
+    const blocks = document.querySelectorAll('code.language-mermaid');
+    let i = 0;
+    for (const code of blocks) {
+      const pre = code.closest('pre');
+      const graph = document.createElement('div');
+      graph.className = 'mermaid';
+      graph.textContent = code.textContent;
+      pre.replaceWith(graph);
+    }
+    try { await mermaid.run(); } catch (e) { /* diagrama opcional */ }
+  </script>
+</body>
+</html>

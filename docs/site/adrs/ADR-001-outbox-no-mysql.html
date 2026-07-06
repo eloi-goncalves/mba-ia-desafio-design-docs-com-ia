@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ADR-001-outbox-no-mysql · Documentacao viva</title>
+  <link rel="stylesheet" href="../styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand"><a href="../index.html">Documentacao viva</a></span>
+    <span class="commit" title="Commit de origem desta documentacao">
+      source_commit: <code>492dd85b257b61fe7a89475453bd96b0abf1bd44</code>
+    </span>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+      <p class="sidebar-title">Documentos</p>
+      <ul>
+<li><a href="../prd.html">PRD</a></li>
+<li><a href="../rfc.html">RFC</a></li>
+<li><a href="../fdd.html">FDD</a></li>
+<li><a href="../adrs/index.html">ADRs</a><ul class="adr-list"><li><a href="../adrs/ADR-001-outbox-no-mysql.html" class="active">ADR-001-outbox-no-mysql</a></li><li><a href="../adrs/ADR-002-retry-backoff-e-dlq.html">ADR-002-retry-backoff-e-dlq</a></li><li><a href="../adrs/ADR-003-hmac-sha256-secret-por-endpoint.html">ADR-003-hmac-sha256-secret-por-endpoint</a></li><li><a href="../adrs/ADR-004-at-least-once-x-event-id.html">ADR-004-at-least-once-x-event-id</a></li><li><a href="../adrs/ADR-005-worker-separado-polling.html">ADR-005-worker-separado-polling</a></li><li><a href="../adrs/ADR-006-reuso-padroes-do-projeto.html">ADR-006-reuso-padroes-do-projeto</a></li><li><a href="../adrs/ADR-007-snapshot-do-payload-na-outbox.html">ADR-007-snapshot-do-payload-na-outbox</a></li></ul></li>
+<li><a href="../tracker.html">Tracker</a></li>
+      </ul>
+    </nav>
+    <main class="content">
+      <article class="markdown-body">
+<h1>ADR-001: Padrão Outbox transacional no MySQL</h1>
+<ul>
+<li><strong>Status:</strong> Aceito</li>
+<li><strong>Data:</strong> 2026-07-03</li>
+<li><strong>Decisores:</strong> Larissa (Tech Lead), Diego (Eng. Sênior), Bruno (Eng.), Sofia (Segurança), Marcos (PM)</li>
+<li><strong>Origem:</strong> reunião técnica de Webhooks, ver <code>TRANSCRICAO.md</code></li>
+</ul>
+<h2>Contexto</h2>
+<p>A feature precisa notificar clientes B2B quando o status de um pedido muda, sem comprometer a consistência do OMS. O ponto de disparo natural é o <code>changeStatus</code>, que já roda dentro de uma transação pesada (atualiza <code>orders</code>, insere em <code>order_status_history</code> e ajusta estoque). Fazer o disparo do webhook de forma síncrona nessa transação foi rejeitado: um HTTP call no meio da transação trava a mudança de status de outros pedidos quando o cliente está lento ou offline (<code>[09:04] Bruno</code>), e não há resposta boa para &quot;e se o cliente estiver fora do ar, dá rollback na mudança de status?&quot; (<code>[09:04] Bruno</code>).</p>
+<p>A necessidade é uma garantia atômica: se a transação de status commitou, o evento existe; se deu rollback, o evento some junto (<code>[09:06] Diego</code>).</p>
+<h2>Decisão</h2>
+<p>Adotar o padrão <strong>Outbox transacional no MySQL existente</strong>. Na mesma transação SQL que atualiza <code>orders</code> e <code>order_status_history</code>, insere-se uma linha na tabela <code>webhook_outbox</code> com o evento. Um worker separado lê essa tabela e dispara as chamadas HTTP (<code>[09:06] Diego</code>, <code>[09:08] Larissa</code>). A tabela tem índice no campo de estado (pendente/processando/falhou/entregue) e em <code>created_at</code>; o worker lê apenas os pendentes em batch pequeno, processa e marca o resultado (<code>[09:08] Diego</code>).</p>
+<h2>Alternativas consideradas</h2>
+<h3>Disparo síncrono no service de orders</h3>
+<ul>
+<li>Descrição: emitir o HTTP call diretamente dentro do <code>changeStatus</code>.</li>
+<li>Por que foi descartada (trade-off): um cliente lento ou offline travaria a mudança de status de outros pedidos, e falha do cliente forçaria decisões ruins sobre rollback da mudança de status (<code>[09:04] Bruno</code>, <code>[09:06] Diego</code>).</li>
+</ul>
+<h3>Redis Streams / fila externa</h3>
+<ul>
+<li>Descrição: publicar o evento em uma fila externa dedicada (ex.: Redis Streams).</li>
+<li>Por que foi descartada (trade-off): exigiria subir mais infraestrutura (ex.: Redis Cluster) para um time pequeno; overengineering quando o MySQL existente já resolve (<code>[09:07] Diego</code>).</li>
+</ul>
+<h2>Consequências</h2>
+<p><strong>Positivas</strong></p>
+<ul>
+<li>Consistência garantida com o commit/rollback da transação principal (<code>[09:06] Diego</code>).</li>
+<li>Nenhuma infraestrutura nova; reaproveita o MySQL e o Prisma já existentes (<code>[09:07] Diego</code>).</li>
+<li>Leitura eficiente via índice em estado e <code>created_at</code> (<code>[09:08] Diego</code>).</li>
+</ul>
+<p><strong>Negativas / trade-offs aceitos</strong></p>
+<ul>
+<li>Introduz uma tabela e um processo de leitura por polling (latência mínima de ~2s, ver ADR-005).</li>
+<li>Linhas entregues acumulam e precisarão de arquivamento futuro (~30 dias), fora do escopo desta feature (<code>[09:08] Diego</code>).</li>
+</ul>
+<h2>Relacionados</h2>
+<ul>
+<li><a href="ADR-005-worker-separado-polling.md">ADR-005: Worker em processo separado com polling</a></li>
+<li><a href="ADR-007-snapshot-do-payload-na-outbox.md">ADR-007: Snapshot do payload na outbox</a></li>
+</ul>
+
+      </article>
+      <footer class="pagefoot">
+        <p>Gerado a partir do commit <code>492dd85b257b</code> em 2026-07-06T20:04:25.625Z.</p>
+      </footer>
+    </main>
+  </div>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: false });
+    const blocks = document.querySelectorAll('code.language-mermaid');
+    let i = 0;
+    for (const code of blocks) {
+      const pre = code.closest('pre');
+      const graph = document.createElement('div');
+      graph.className = 'mermaid';
+      graph.textContent = code.textContent;
+      pre.replaceWith(graph);
+    }
+    try { await mermaid.run(); } catch (e) { /* diagrama opcional */ }
+  </script>
+</body>
+</html>
